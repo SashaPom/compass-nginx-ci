@@ -1,0 +1,97 @@
+name: Compass service qualification
+on:
+  push:
+    branches: [main, media-type-check]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  qualify:
+    name: Run Compass on Ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    env:
+      BASE_URL: http://127.0.0.1:8674
+      EXPECTED_RELEASE: devops7-compass-21
+      CHECK_TIMEOUT: '2.5'
+      CONTAINER_NAME: compass-web
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Prepare Python test tools
+        id: deps
+        run: |
+          mkdir -p reports
+          python -m pip install -r requirements.txt 2>&1 | tee reports/install.log
+      - name: Assemble and start the Compass image
+        run: |
+          docker build -t "compass-lab:$GITHUB_SHA" . 2>&1 | tee reports/build.log
+          docker run -d --name "$CONTAINER_NAME" -p 127.0.0.1:8674:8080 "compass-lab:$GITHUB_SHA"
+      - name: Wait for HTTP on the published port
+        id: ready
+        run: |
+          timeout 20s curl -fsS --retry 10 --retry-all-errors --retry-delay 1 \
+            --max-time 2 -o /dev/null -w 'HTTP %{http_code}\n' "$BASE_URL/" \
+            2>&1 | tee reports/readiness.log
+      - name: Check files and Nginx configuration
+        id: runtime
+        run: |
+          python -m pytest -q --hosts="docker://$CONTAINER_NAME" checks/runtime \
+            --junitxml=reports/runtime.xml 2>&1 | tee reports/runtime.log
+      - name: Verify external HTTP responses
+        id: http
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: |
+          python -m pytest -q checks/http --junitxml=reports/http.xml \
+            2>&1 | tee reports/http.log
+      - name: Test the curl wrapper in isolation
+        id: unit
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          python -m pytest -q checks/unit --junitxml=reports/unit.xml \
+            2>&1 | tee reports/unit.log
+      - name: Run the live homepage probe
+        id: probe
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: python probe_compass.py 2>&1 | tee reports/probe.log
+      - name: Готовність підтверджено
+        if: success()
+        run: echo "The Compass release passed all checks."
+      - name: Summarize the observed outcomes
+        if: always()
+        env:
+          FILES: ${{ steps.runtime.outcome }}
+          HTTP: ${{ steps.http.outcome }}
+          UNIT: ${{ steps.unit.outcome }}
+          CLI: ${{ steps.probe.outcome }}
+        run: |
+          {
+            printf '### Compass\n\nCommit %s\n\n' "$GITHUB_SHA"
+            printf '| Check | Outcome |\n| --- | --- |\n'
+            printf '| %s | %s |\n' Testinfra "$FILES" HTTP "$HTTP" Unit "$UNIT" Curl "$CLI"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save logs and remove the container
+        if: always()
+        run: |
+          mkdir -p reports
+          if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+            docker logs "$CONTAINER_NAME" > reports/nginx.log 2>&1 || true
+            docker rm -f "$CONTAINER_NAME" | tee reports/cleanup.log
+          fi
+      - name: Upload the Compass evidence
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: compass-evidence
+          path: reports/
+          retention-days: 7

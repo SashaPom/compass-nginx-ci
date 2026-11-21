@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!nginx/
+!nginx/site.conf
+!web/
+!web/index.html
+!web/health.json
